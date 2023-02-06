@@ -43,7 +43,7 @@ type uploadChunk struct {
 	close  bool
 }
 
-func hashChunks(reader io.Reader, size int) string {
+func hashChunks(reader io.Reader, size int) (string, error) {
 	resultHasher := sha256.New()
 
 	bytesLeft := size
@@ -52,24 +52,25 @@ func hashChunks(reader io.Reader, size int) string {
 		n, err := reader.Read(block)
 		bytesLeft -= n
 		if err != nil {
-			// TODO handle error
-			return ""
+			return "", err
 		}
 		hash := sha256.Sum256(block[:n])
 		_, err = resultHasher.Write(hash[:])
 		if err != nil {
-			// TODO handle error
-			panic("unhandled error: TODO")
+			return "", err
 		}
 	}
-	return hex.EncodeToString(resultHasher.Sum(nil))
+	return hex.EncodeToString(resultHasher.Sum(nil)), nil
 }
 
 func uploadOneChunk(dbx files.Client, args *files.UploadSessionAppendArg, data []byte) error {
 	for {
-		contentHash := hashChunks(bytes.NewReader(data), len(data))
+		contentHash, err := hashChunks(bytes.NewReader(data), len(data))
+		if err != nil {
+			return err
+		}
 		args.ContentHash = contentHash
-		err := dbx.UploadSessionAppendV2(args, bytes.NewReader(data))
+		err = dbx.UploadSessionAppendV2(args, bytes.NewReader(data))
 		if err != nil {
 			switch errt := err.(type) {
 			case auth.RateLimitAPIError:
@@ -208,15 +209,14 @@ func put(cmd *cobra.Command, args []string) (err error) {
 	if err != nil {
 		return
 	}
-	defer contents.Close()
+	defer func(contents *os.File) {
+		err := contents.Close()
+		if err != nil {
+			return
+		}
+	}(contents)
 
 	contentsInfo, err := contents.Stat()
-	if err != nil {
-		return
-	}
-
-	contentHash := hashChunks(contents, int(contentsInfo.Size()))
-	_, err = contents.Seek(0, io.SeekStart)
 	if err != nil {
 		return
 	}
@@ -243,6 +243,15 @@ func put(cmd *cobra.Command, args []string) (err error) {
 	dbx := files.New(config)
 	if contentsInfo.Size() > singleShotUploadSizeCutoff {
 		return uploadChunked(dbx, progressbar, commitInfo, contentsInfo.Size(), workers, chunkSize, debug)
+	}
+
+	contentHash, err := hashChunks(contents, int(contentsInfo.Size()))
+	if err != nil {
+		return
+	}
+	_, err = contents.Seek(0, io.SeekStart)
+	if err != nil {
+		return
 	}
 
 	if _, err = dbx.Upload(&files.UploadArg{
