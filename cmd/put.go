@@ -16,10 +16,11 @@ package cmd
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path"
@@ -34,6 +35,7 @@ import (
 )
 
 const singleShotUploadSizeCutoff int64 = 32 * (1 << 20)
+const HashBlockSize = 1024 * 1024 * 4
 
 type uploadChunk struct {
 	data   []byte
@@ -41,8 +43,32 @@ type uploadChunk struct {
 	close  bool
 }
 
+func hashChunks(reader io.Reader, size int) string {
+	resultHasher := sha256.New()
+
+	bytesLeft := size
+	for bytesLeft > 0 {
+		block := make([]byte, HashBlockSize)
+		n, err := reader.Read(block)
+		bytesLeft -= n
+		if err != nil {
+			// TODO handle error
+			return ""
+		}
+		hash := sha256.Sum256(block[:n])
+		_, err = resultHasher.Write(hash[:])
+		if err != nil {
+			// TODO handle error
+			panic("unhandled error: TODO")
+		}
+	}
+	return hex.EncodeToString(resultHasher.Sum(nil))
+}
+
 func uploadOneChunk(dbx files.Client, args *files.UploadSessionAppendArg, data []byte) error {
 	for {
+		contentHash := hashChunks(bytes.NewReader(data), len(data))
+		args.ContentHash = contentHash
 		err := dbx.UploadSessionAppendV2(args, bytes.NewReader(data))
 		if err != nil {
 			switch errt := err.(type) {
@@ -77,7 +103,9 @@ func uploadChunked(dbx files.Client, r io.Reader, commitInfo *files.CommitInfo, 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer func() {
+				wg.Done()
+			}()
 			for chunk := range workCh {
 				cursor := files.NewUploadSessionCursor(res.SessionId, chunk.offset)
 				args := files.NewUploadSessionAppendArg(cursor)
@@ -96,7 +124,7 @@ func uploadChunked(dbx files.Client, r io.Reader, commitInfo *files.CommitInfo, 
 
 	written := int64(0)
 	for written < sizeTotal {
-		data, err := ioutil.ReadAll(&io.LimitedReader{R: r, N: chunkSize})
+		data, err := io.ReadAll(&io.LimitedReader{R: r, N: chunkSize})
 		if err != nil {
 			return err
 		}
@@ -187,6 +215,15 @@ func put(cmd *cobra.Command, args []string) (err error) {
 		return
 	}
 
+	contentHash := hashChunks(contents, int(contentsInfo.Size()))
+	_, err = contents.Seek(0, io.SeekStart)
+	if err != nil {
+		return
+	}
+
+	if err != nil {
+		return
+	}
 	progressbar := &ioprogress.Reader{
 		Reader: contents,
 		DrawFunc: ioprogress.DrawTerminalf(os.Stderr, func(progress, total int64) string {
@@ -208,7 +245,10 @@ func put(cmd *cobra.Command, args []string) (err error) {
 		return uploadChunked(dbx, progressbar, commitInfo, contentsInfo.Size(), workers, chunkSize, debug)
 	}
 
-	if _, err = dbx.Upload(commitInfo, progressbar); err != nil {
+	if _, err = dbx.Upload(&files.UploadArg{
+		CommitInfo:  *commitInfo,
+		ContentHash: contentHash,
+	}, progressbar); err != nil {
 		return
 	}
 
