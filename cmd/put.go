@@ -20,10 +20,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
 	"io"
 	"log"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +36,8 @@ import (
 	"github.com/mitchellh/ioprogress"
 	"github.com/spf13/cobra"
 )
+
+var dbx files.Client
 
 const singleShotUploadSizeCutoff int64 = 32 * (1 << 20)
 const HashBlockSize = 1024 * 1024 * 4
@@ -63,7 +68,9 @@ func hashChunks(reader io.Reader, size int) (string, error) {
 	return hex.EncodeToString(resultHasher.Sum(nil)), nil
 }
 
-func uploadOneChunk(dbx files.Client, args *files.UploadSessionAppendArg, data []byte) error {
+func uploadOneChunk(args *files.UploadSessionAppendArg, data []byte, conf *oauth2.Config, token *oauth2.Token) error {
+	//time.Sleep(4 * time.Hour)
+	attemptsFailed := 0
 	for {
 		contentHash, err := hashChunks(bytes.NewReader(data), len(data))
 		if err != nil {
@@ -76,6 +83,24 @@ func uploadOneChunk(dbx files.Client, args *files.UploadSessionAppendArg, data [
 			case auth.RateLimitAPIError:
 				time.Sleep(time.Second * time.Duration(errt.RateLimitError.RetryAfter))
 				continue
+			case auth.AuthAPIError:
+				attemptsFailed += 1
+				if strings.HasPrefix(err.Error(), "expired_access_token/") {
+					ctx := context.Background()
+					refreshedToken, err := conf.TokenSource(ctx, token).Token()
+					if err != nil {
+						return err
+					}
+					// TODO write into config
+					config.Token = refreshedToken.AccessToken
+					dbx = files.New(config)
+					fmt.Println("renewed token")
+				}
+				fmt.Println("Auth Error got:", errt.AuthError, errt.ErrorSummary, errt.Error())
+				if attemptsFailed >= 2 {
+					return err
+				}
+				continue
 			default:
 				return err
 			}
@@ -84,7 +109,7 @@ func uploadOneChunk(dbx files.Client, args *files.UploadSessionAppendArg, data [
 	}
 }
 
-func uploadChunked(dbx files.Client, r io.Reader, commitInfo *files.CommitInfo, sizeTotal int64, workers int, chunkSize int64, debug bool) (err error) {
+func uploadChunked(r io.Reader, commitInfo *files.CommitInfo, sizeTotal int64, workers int, chunkSize int64, conf *oauth2.Config, token *oauth2.Token, debug bool) (err error) {
 	t0 := time.Now()
 	startArgs := files.NewUploadSessionStartArg()
 	startArgs.SessionType = &files.UploadSessionType{}
@@ -113,7 +138,7 @@ func uploadChunked(dbx files.Client, r io.Reader, commitInfo *files.CommitInfo, 
 				args.Close = chunk.close
 
 				t0 := time.Now()
-				if err := uploadOneChunk(dbx, args, chunk.data); err != nil {
+				if err := uploadOneChunk(args, chunk.data, conf, token); err != nil {
 					errCh <- err
 				}
 				if debug {
@@ -240,9 +265,13 @@ func put(cmd *cobra.Command, args []string) (err error) {
 	ts := time.Now().UTC().Round(time.Second)
 	commitInfo.ClientModified = &ts
 
-	dbx := files.New(config)
+	dbx = files.New(config)
 	if contentsInfo.Size() > singleShotUploadSizeCutoff {
-		return uploadChunked(dbx, progressbar, commitInfo, contentsInfo.Size(), workers, chunkSize, debug)
+		domain, _ := cmd.Flags().GetString("domain")
+		tokenType := TokenType(cmd)
+		token := tokenMap[domain][tokenType]
+		conf := OauthConfig(tokenType, domain)
+		return uploadChunked(progressbar, commitInfo, contentsInfo.Size(), workers, chunkSize, conf, &token, debug)
 	}
 
 	contentHash, err := hashChunks(contents, int(contentsInfo.Size()))

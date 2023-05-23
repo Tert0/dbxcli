@@ -62,8 +62,9 @@ var (
 type TokenMap map[string]map[string]oauth2.Token
 
 var config dropbox.Config
+var tokenMap TokenMap
 
-func oauthConfig(tokenType string, domain string) *oauth2.Config {
+func OauthConfig(tokenType string, domain string) *oauth2.Config {
 	var appKey, appSecret string
 	switch tokenType {
 	case "personal":
@@ -141,7 +142,7 @@ func writeTokens(filePath string, tokens TokenMap) {
 	}
 }
 
-func tokenType(cmd *cobra.Command) string {
+func TokenType(cmd *cobra.Command) string {
 	if cmd.Parent().Name() == "team" {
 		return tokenTeamManage
 	}
@@ -161,10 +162,10 @@ func initDbx(cmd *cobra.Command, args []string) (err error) {
 		return
 	}
 	filePath := path.Join(dir, ".config", "dbxcli", configFileName)
-	tokType := tokenType(cmd)
-	conf := oauthConfig(tokType, domain)
+	tokType := TokenType(cmd)
+	conf := OauthConfig(tokType, domain)
 
-	tokenMap, err := readTokens(filePath)
+	tokenMap, err = readTokens(filePath)
 	if tokenMap == nil {
 		tokenMap = make(TokenMap)
 	}
